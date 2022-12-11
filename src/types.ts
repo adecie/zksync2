@@ -38,3 +38,9 @@ export enum SwapState {
     deposited,
     finalized
 }
+
+export type Transaction = types.Transfer | types.Withdraw | types.ChangePubKey;
+export type SignedTransaction = {
+    tx: Transaction;
+    ethereumSignature?: types.TxEthSignature;
+};

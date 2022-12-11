@@ -1,27 +1,25 @@
 import * as zksync from 'zksync';
-import { ethers, utils } from 'ethers';
+import { ethers, utils, BigNumber } from 'ethers';
 import { MusigSigner } from './signer';
-import { SwapData, SwapState } from './types';
-import { getSyncKeys, SYNC_TX_PREFIX, getFeeType, getTargetAddress } from './utils';
+import { SwapData, SwapState, SignedTransaction, Transaction } from './types';
+import { getSyncKeys, SYNC_TX_PREFIX } from './utils';
 
 export class SwapParty {
     protected signer: MusigSigner;
-    protected transactions: any[];
+    protected transactions: Transaction[];
     protected swapData: SwapData;
     protected pubKeyHash: Uint8Array;
-    protected state: SwapState;
+    protected state: SwapState = SwapState.empty;
     protected create2Info: {
-        salt: string;
-        address: string;
-    };
+        salt?: string;
+        address?: string;
+    } = {};
 
     protected constructor(
         protected privateKey: string,
-        protected publicKey: string,
-        protected syncWallet: zksync.Wallet
-    ) {
-        this.state = SwapState.empty;
-    }
+        public readonly publicKey: string,
+        public readonly syncWallet: zksync.Wallet
+    ) {}
 
     protected static async init(
         privateKey: string,
@@ -36,10 +34,6 @@ export class SwapParty {
 
     address() {
         return this.syncWallet.address();
-    }
-
-    pubkey() {
-        return this.publicKey;
     }
 
     /** @returns zkSync account ID */
@@ -68,28 +62,15 @@ export class SwapParty {
         this.state = SwapState.empty;
     }
 
-    protected getSignBytes(transaction: any): Uint8Array {
-        switch (transaction.type) {
-            case 'Transfer':
-                return this.syncWallet.signer.transferSignBytes(transaction);
-            case 'ChangePubKey':
-                return this.syncWallet.signer.changePubKeySignBytes(transaction);
-            case 'Withdraw':
-                return this.syncWallet.signer.withdrawSignBytes(transaction);
-            default:
-                throw new Error('Invalid transaction type');
-        }
-    }
-
-    protected async isTxExecuted(transacion: any) {
-        const hash = utils.sha256(this.getSignBytes(transacion)).replace('0x', SYNC_TX_PREFIX);
+    protected async isTxExecuted(transacion: Transaction) {
+        const hash = utils.sha256(zksync.utils.serializeTx(transacion)).replace('0x', SYNC_TX_PREFIX);
         const receipt = await this.syncWallet.provider.getTxReceipt(hash);
         return receipt.executed && receipt.success;
     }
 
-    protected async deposit(
+    async deposit(
         token: zksync.types.TokenLike,
-        amount: ethers.BigNumber,
+        amount: BigNumber,
         depositType: 'L1' | 'L2' = 'L2',
         autoApprove: boolean = true
     ) {
@@ -111,8 +92,12 @@ export class SwapParty {
         return hash;
     }
 
-    protected async sendBatch(txs: any[], token: zksync.types.TokenLike) {
-        let batch = [];
+    protected async sendBatch(
+        txs: Transaction[],
+        token: zksync.types.TokenLike,
+        depositAmount: ethers.BigNumberish = 0
+    ) {
+        let batch: SignedTransaction[] = [];
         for (const tx of txs) {
             if (!(await this.isTxExecuted(tx))) {
                 batch.push({ tx });
@@ -122,20 +107,40 @@ export class SwapParty {
             return [];
         }
         const fee = await this.syncWallet.provider.getTransactionsBatchFee(
-            batch.map((tx) => getFeeType(tx.tx)).concat(['Transfer']),
-            batch.map((tx) => getTargetAddress(tx.tx)).concat([this.address()]),
+            [...batch.map((tx) => getFeeType(tx.tx)), 'Transfer'],
+            [...batch.map((tx) => getTargetAddress(tx.tx)), this.swapAddress()],
             token
         );
-        const feePayingTx = await this.syncWallet.signSyncTransfer({
-            to: this.address(),
+        const feePayingTx = (await this.syncWallet.signSyncTransfer({
+            to: this.swapAddress(),
             token,
-            amount: 0,
+            amount: depositAmount,
             fee,
             nonce: await this.syncWallet.getNonce()
-        });
-        batch.push(feePayingTx);
+        })) as SignedTransaction;
+        if (batch[0].tx.type == 'ChangePubKey') {
+            batch.splice(1, 0, feePayingTx);
+        } else {
+            batch.unshift(feePayingTx);
+        }
         const handles = await zksync.wallet.submitSignedTransactionsBatch(this.syncWallet.provider, batch, []);
         await Promise.all(handles.map((handle) => handle.awaitReceipt()));
         return handles.map((handle) => handle.txHash);
     }
+}
+
+function getTargetAddress(transaction: Transaction) {
+    if (transaction.type == 'ChangePubKey') {
+        return transaction.account;
+    }
+    return transaction.to;
+}
+
+function getFeeType(transaction: Transaction) {
+    if (transaction.type == 'ChangePubKey') {
+        return {
+            ChangePubKey: transaction.ethAuthData.type
+        };
+    }
+    return transaction.type;
 }

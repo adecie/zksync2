@@ -26,6 +26,8 @@ Array.prototype.last = function () {
 describe('Tests', () => {
     let client: SwapClient;
     let provider: SwapProvider;
+    let backupClient: SwapClient;
+    let backupProvider: SwapProvider;
     let rich: ethers.Wallet;
     let ethProvider: ethers.providers.Provider;
     let syncProvider: zksync.Provider;
@@ -74,7 +76,7 @@ describe('Tests', () => {
     }
 
     async function exchangeSwapInfo(client: SwapClient, provider: SwapProvider, verify: boolean = false) {
-        const response = await provider.prepareSwap(swapData, client.pubkey(), client.address());
+        const response = await provider.prepareSwap(swapData, client.publicKey, client.address());
         console.log('    provider prepared for the swap');
         const data = await client.prepareSwap(swapData, response.publicKey, response.address, response.precommitments);
         console.log('    client prepared for the swap');
@@ -103,6 +105,8 @@ describe('Tests', () => {
         const providerKey = await createWallet(richWallet, 'DAI', utils.parseUnits('50000.0', 18));
         client = await SwapClient.init(clientKey, ethProvider, syncProvider);
         provider = await SwapProvider.init(providerKey, ethProvider, syncProvider);
+        backupClient = await SwapClient.init(clientKey, ethProvider, syncProvider);
+        backupProvider = await SwapProvider.init(providerKey, ethProvider, syncProvider);
 
         // extract CREATE2 data
         const rescuerBytecode = '0x' + fs.readFileSync(RESCUER_CONTRACT).toString();
@@ -141,7 +145,6 @@ describe('Tests', () => {
             client.wait(),
             (async () => {
                 await new Promise((r) => setTimeout(r, 3000));
-                await provider.depositFunds();
                 await provider.finalizeSwap();
             })()
         ]);
@@ -156,7 +159,7 @@ describe('Tests', () => {
         const clientBalance = await getBalance(client.address(), 'DAI');
 
         await exchangeSwapInfo(client, provider);
-        await provider.depositFunds();
+        await provider.deposit(swapData.buy.token, swapData.buy.amount);
         await client.finalizeSwap();
 
         const newClientBalance = await getBalance(client.address(), 'DAI');
@@ -178,6 +181,23 @@ describe('Tests', () => {
         swapData.timeout = Math.floor(Date.now() / 1000) + 600;
     });
 
+    it('should save and load signed transactions', async () => {
+        const providerBalance = await getBalance(provider.address(), 'ETH');
+        const clientBalance = await getBalance(client.address(), 'DAI');
+
+        await exchangeSwapInfo(client, provider);
+
+        await backupClient.loadSwap(swapData, client.signedTransactions());
+        await backupProvider.loadSwap(swapData, provider.signedTransactions());
+
+        await backupProvider.finalizeSwap();
+
+        const newProviderBalance = await getBalance(provider.address(), 'ETH');
+        const newClientBalance = await getBalance(client.address(), 'DAI');
+        expect(newProviderBalance.sub(providerBalance).eq(utils.parseEther('1.0'))).to.be.true;
+        expect(newClientBalance.sub(clientBalance).eq(utils.parseUnits('1000.0', 18))).to.be.true;
+    });
+
     it('should rescue funds in case of exodus mode', async () => {
         const syncContract = new ethers.Contract(
             syncProvider.contractAddress.mainContract,
@@ -190,11 +210,8 @@ describe('Tests', () => {
             verifyTxHash = event.transactionHash;
         });
 
-        await exchangeSwapInfo(client, provider, true);
-        const hash = await provider.depositFunds();
-
         // wait until the deposits are verified
-        await syncProvider.notifyTransaction(hash, 'VERIFY');
+        await exchangeSwapInfo(client, provider, true);
         console.log('      transactions verified');
 
         // enter exodus mode
